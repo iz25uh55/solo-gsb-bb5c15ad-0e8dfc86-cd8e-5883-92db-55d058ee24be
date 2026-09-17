@@ -11,7 +11,8 @@
 - 同一用户在配置不变时判定结果**稳定**（哈希输入只有 `flag_key:user_id`）；
 - 每次创建 / 更新在**同一事务**中保存一份**不可变配置版本**，历史版本可查询、可指定用于判定；
 - 判定响应包含**命中规则、分桶值、最终变体的完整解释链**；
-- 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**。
+- 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**；
+- 发布前可用 `preview-impact` 对候选配置做**只读**影响评估（不写配置版本与判定快照）。
 
 ## 一条命令启动
 
@@ -63,6 +64,7 @@ curl -sS http://localhost:8000/api/v1/decisions/<request_id>
 | `GET` | `/api/v1/flags/{flag_key}/versions` | 列出全部配置版本（按版本号升序） |
 | `GET` | `/api/v1/flags/{flag_key}/versions/{version}` | 查看指定版本的完整配置 |
 | `POST` | `/api/v1/flags/{flag_key}/evaluate` | 判定（推荐，flag_key 在路径中，可指定 `config_version`） |
+| `POST` | `/api/v1/flags/{flag_key}/preview-impact` | 发布前影响评估：当前版本 vs 候选配置（只读） |
 | `POST` | `/api/v1/evaluate` | 判定（flag_key 在请求体中） |
 | `GET` | `/api/v1/decisions/{request_id}` | 按 request_id 查询判定快照 |
 | `GET` | `/healthz` | 健康检查 |
@@ -169,6 +171,64 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/evaluate \
 ### 幂等
 
 判定请求可携带自定义 `request_id`。同一 `request_id` 的重复请求直接返回**首次判定快照**（即使第二次 context 或 `config_version` 不同），适合客户端超时重试。若同一 `request_id` 搭配了不同的 `flag_key/user_id`，返回 `409`。不携带时服务自动生成 UUID。
+
+### 发布前影响评估（preview-impact）
+
+`POST /api/v1/flags/{flag_key}/preview-impact` 用**当前版本**与请求体中的**候选配置**分别对同一批用户做只读判定，返回结果发生变化的用户与变体迁移汇总。整个接口不产生任何写入：不新增配置版本、不落 `DecisionSnapshot`。
+
+- 请求体的 `variants/rules` 与创建接口**同结构、同校验**（权重和 100、priority 唯一、规则必须引用已配置变体等，违反返回 `422`）；`flag_key` 取路径值，无需在请求体中重复；
+- `users` 为 1～500 个**互异** `user_id`（可带 `context`）；`user_id` 重复或数量超限返回 `422`；开关不存在返回 `404`；
+- 判定复用与线上一致的稳定分桶与首命中规则语义，`matched_rule_index` 为规则按 `priority` 升序排序后的下标；
+- “结果发生变化”指 `(variant_key, decision_path, matched_rule_index)` 任一不同——包括变体未变但判定路径变化（如分桶变为规则命中）的情形。
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/flags/new_checkout/preview-impact \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "variants": [
+      {"key": "on",  "weight": 50},
+      {"key": "off", "weight": 50}
+    ],
+    "rules": [
+      {"priority": 1, "attribute": "employee", "operator": "eq", "values": [true], "variant_key": "on"}
+    ],
+    "users": [
+      {"user_id": "user-1001", "context": {"employee": true}},
+      {"user_id": "user-1002", "context": {}},
+      {"user_id": "user-1003", "context": {"region": "cn-beta"}}
+    ]
+  }'
+```
+
+响应示例（`changes` 按请求顺序，仅含结果变化的用户）：
+
+```json
+{
+  "flag_key": "new_checkout",
+  "config_version": 1,
+  "total_users": 3,
+  "changed_users": 2,
+  "variant_migrations": [
+    {"from_variant": "off", "to_variant": "on",  "count": 1},
+    {"from_variant": "on",  "to_variant": "off", "count": 1}
+  ],
+  "changes": [
+    {
+      "user_id": "user-1002",
+      "current":   {"variant_key": "off", "decision_path": "bucket", "matched_rule_index": null},
+      "candidate": {"variant_key": "on",  "decision_path": "bucket", "matched_rule_index": null}
+    },
+    {
+      "user_id": "user-1003",
+      "current":   {"variant_key": "on",  "decision_path": "rule",   "matched_rule_index": 1},
+      "candidate": {"variant_key": "off", "decision_path": "bucket", "matched_rule_index": null}
+    }
+  ]
+}
+```
+
+- `variant_migrations` 按 `from_variant -> to_variant` 汇总所有变化用户（变体未变但路径变化的计为 `x -> x`），各项 `count` 之和等于 `changed_users`；
+- `config_version` 为 current 一侧使用的当前配置版本号。
 
 ## 分桶算法
 

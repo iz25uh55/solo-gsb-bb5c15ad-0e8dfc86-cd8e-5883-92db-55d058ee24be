@@ -374,3 +374,229 @@ def test_delete_flag_removes_versions(client):
     assert resp.json()["version"] == 1
     versions = client.get("/api/v1/flags/ver_flag/versions").json()
     assert [v["version"] for v in versions] == [1]
+
+
+# ---------- preview-impact：发布前影响评估 ----------
+
+
+def _preview_body(users, **overrides):
+    body = {
+        "variants": [{"key": "red", "weight": 50}, {"key": "blue", "weight": 50}],
+        "rules": [],
+        "users": users,
+    }
+    body.update(overrides)
+    return body
+
+
+def test_preview_impact_unknown_flag_404(client):
+    resp = client.post(
+        "/api/v1/flags/nope/preview-impact",
+        json=_preview_body([{"user_id": "u1"}]),
+    )
+    assert resp.status_code == 404
+
+
+def test_preview_impact_reuses_config_validation(client, simple_flag):
+    # 权重和不为 100
+    resp = client.post(
+        "/api/v1/flags/btn_color/preview-impact",
+        json=_preview_body(
+            [{"user_id": "u1"}],
+            variants=[{"key": "red", "weight": 60}, {"key": "blue", "weight": 30}],
+        ),
+    )
+    assert resp.status_code == 422
+    assert "100" in resp.text
+
+    # 规则引用不存在的变体
+    resp = client.post(
+        "/api/v1/flags/btn_color/preview-impact",
+        json=_preview_body(
+            [{"user_id": "u1"}],
+            rules=[
+                {"priority": 1, "attribute": "x", "operator": "eq", "values": [1], "variant_key": "ghost"}
+            ],
+        ),
+    )
+    assert resp.status_code == 422
+
+    # 变体 key 重复 / 规则 priority 重复
+    resp = client.post(
+        "/api/v1/flags/btn_color/preview-impact",
+        json=_preview_body(
+            [{"user_id": "u1"}],
+            variants=[{"key": "red", "weight": 50}, {"key": "red", "weight": 50}],
+        ),
+    )
+    assert resp.status_code == 422
+
+
+def test_preview_impact_rejects_duplicate_user_ids(client, simple_flag):
+    resp = client.post(
+        "/api/v1/flags/btn_color/preview-impact",
+        json=_preview_body([{"user_id": "u1"}, {"user_id": "u2"}, {"user_id": "u1"}]),
+    )
+    assert resp.status_code == 422
+    assert "user_id" in resp.text
+
+
+def test_preview_impact_user_count_limits(client, simple_flag):
+    def users(n):
+        return [{"user_id": f"u{i}"} for i in range(n)]
+
+    url = "/api/v1/flags/btn_color/preview-impact"
+    assert client.post(url, json=_preview_body(users(0))).status_code == 422
+    assert client.post(url, json=_preview_body(users(501))).status_code == 422
+    resp = client.post(url, json=_preview_body(users(500)))
+    assert resp.status_code == 200
+    assert resp.json()["total_users"] == 500
+
+
+def test_preview_impact_weight_flip_migration(client):
+    client.post(
+        "/api/v1/flags",
+        json={
+            "flag_key": "flip",
+            "variants": [{"key": "red", "weight": 100}, {"key": "blue", "weight": 0}],
+            "rules": [],
+        },
+    )
+    resp = client.post(
+        "/api/v1/flags/flip/preview-impact",
+        json=_preview_body(
+            [{"user_id": f"u{i}"} for i in range(5)],
+            variants=[{"key": "red", "weight": 0}, {"key": "blue", "weight": 100}],
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["flag_key"] == "flip"
+    assert body["config_version"] == 1
+    assert body["total_users"] == 5
+    assert body["changed_users"] == 5
+    # 按请求顺序返回
+    assert [c["user_id"] for c in body["changes"]] == [f"u{i}" for i in range(5)]
+    for c in body["changes"]:
+        assert c["current"] == {
+            "variant_key": "red",
+            "decision_path": "bucket",
+            "matched_rule_index": None,
+        }
+        assert c["candidate"] == {
+            "variant_key": "blue",
+            "decision_path": "bucket",
+            "matched_rule_index": None,
+        }
+    assert body["variant_migrations"] == [
+        {"from_variant": "red", "to_variant": "blue", "count": 5}
+    ]
+
+
+def test_preview_impact_rule_added(client):
+    client.post(
+        "/api/v1/flags",
+        json={
+            "flag_key": "imp",
+            "variants": [{"key": "red", "weight": 50}, {"key": "blue", "weight": 50}],
+            "rules": [],
+        },
+    )
+    # 找一个分桶到 red（<50）和 blue（>=50）的用户
+    red_user = next(f"u{i}" for i in range(1000) if stable_bucket("imp", f"u{i}") < 50)
+    blue_user = next(f"u{i}" for i in range(1000) if stable_bucket("imp", f"u{i}") >= 50)
+    rule = {
+        "priority": 1,
+        "attribute": "region",
+        "operator": "eq",
+        "values": ["cn"],
+        "variant_key": "red",
+    }
+    resp = client.post(
+        "/api/v1/flags/imp/preview-impact",
+        json=_preview_body(
+            [
+                {"user_id": blue_user, "context": {"region": "cn"}},  # bucket(blue) -> rule(red)
+                {"user_id": red_user, "context": {"region": "cn"}},   # bucket(red) -> rule(red)
+                {"user_id": "plain-user", "context": {}},             # 规则未命中，无变化
+            ],
+            rules=[rule],
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["total_users"] == 3
+    assert body["changed_users"] == 2
+    assert [c["user_id"] for c in body["changes"]] == [blue_user, red_user]
+
+    first, second = body["changes"]
+    assert first["current"]["variant_key"] == "blue"
+    assert first["current"]["decision_path"] == "bucket"
+    assert first["candidate"] == {
+        "variant_key": "red",
+        "decision_path": "rule",
+        "matched_rule_index": 0,
+    }
+    # 变体未变但判定路径变化，同样计入变化
+    assert second["current"] == {
+        "variant_key": "red",
+        "decision_path": "bucket",
+        "matched_rule_index": None,
+    }
+    assert second["candidate"]["decision_path"] == "rule"
+    assert second["candidate"]["matched_rule_index"] == 0
+
+    assert body["variant_migrations"] == [
+        {"from_variant": "blue", "to_variant": "red", "count": 1},
+        {"from_variant": "red", "to_variant": "red", "count": 1},
+    ]
+
+
+def test_preview_impact_identical_config_no_changes(client, simple_flag):
+    resp = client.post(
+        "/api/v1/flags/btn_color/preview-impact",
+        json=_preview_body(
+            [{"user_id": "u1", "context": {"region": "cn"}}, {"user_id": "u2"}],
+            rules=[
+                {
+                    "priority": 1,
+                    "attribute": "region",
+                    "operator": "eq",
+                    "values": ["cn"],
+                    "variant_key": "red",
+                }
+            ],
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["total_users"] == 2
+    assert body["changed_users"] == 0
+    assert body["changes"] == []
+    assert body["variant_migrations"] == []
+
+
+def test_preview_impact_is_read_only(client, simple_flag):
+    snapshots_before = client.get("/healthz").json()["snapshots"]
+    resp = client.post(
+        "/api/v1/flags/btn_color/preview-impact",
+        json=_preview_body(
+            [{"user_id": "u1", "context": {"region": "cn"}}, {"user_id": "u2"}],
+            variants=[{"key": "red", "weight": 0}, {"key": "blue", "weight": 100}],
+            rules=[
+                {
+                    "priority": 1,
+                    "attribute": "region",
+                    "operator": "eq",
+                    "values": ["cn"],
+                    "variant_key": "blue",
+                }
+            ],
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    # 不写 DecisionSnapshot、不新增配置版本、当前配置不变
+    assert client.get("/healthz").json()["snapshots"] == snapshots_before
+    assert client.get("/api/v1/flags/btn_color").json()["version"] == 1
+    versions = client.get("/api/v1/flags/btn_color/versions").json()
+    assert [v["version"] for v in versions] == [1]

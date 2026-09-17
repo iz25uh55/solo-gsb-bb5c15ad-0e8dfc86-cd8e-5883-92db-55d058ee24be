@@ -8,6 +8,7 @@
 - GET  /api/v1/flags/{flag_key}/versions            列出版本历史
 - GET  /api/v1/flags/{flag_key}/versions/{version}  查看指定版本配置
 - POST /api/v1/flags/{flag_key}/evaluate  判定（按路径中的 flag_key，可指定 config_version）
+- POST /api/v1/flags/{flag_key}/preview-impact  发布前影响评估（当前版本 vs 候选配置，只读）
 - POST /api/v1/evaluate           判定（flag_key 在请求体中）
 - GET  /api/v1/decisions/{request_id}     按 request_id 查询判定快照
 - GET  /healthz                   健康检查
@@ -24,7 +25,7 @@ from sqlalchemy.orm import Session
 
 from app import crud
 from app.database import Base, engine, get_db
-from app.engine import RuleEvaluationError, decide
+from app.engine import Rule, RuleEvaluationError, Variant, decide
 from app.models import FlagConfig
 from app.schemas import (
     EvaluateRequest,
@@ -32,6 +33,11 @@ from app.schemas import (
     FlagResponse,
     FlagUpsertRequest,
     FlagVersionResponse,
+    PreviewChange,
+    PreviewDecision,
+    PreviewImpactRequest,
+    PreviewImpactResponse,
+    VariantMigration,
 )
 
 
@@ -299,6 +305,68 @@ def evaluate_by_path(flag_key: str, req: EvaluateRequest, db: Session = Depends(
             detail="路径 flag_key 与请求体 flag_key 不一致",
         )
     return _evaluate(req, db, flag_key)
+
+
+@app.post(
+    "/api/v1/flags/{flag_key}/preview-impact", response_model=PreviewImpactResponse
+)
+def preview_impact(flag_key: str, req: PreviewImpactRequest, db: Session = Depends(get_db)):
+    """发布前影响评估：当前版本与候选配置分别做只读判定并对比。
+
+    纯只读：不新增配置版本、不写 DecisionSnapshot。仅返回判定结果
+    （variant_key / decision_path / matched_rule_index）发生变化的用户。
+    """
+    flag = crud.get_flag_or_none(db, flag_key)
+    if flag is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"开关 {flag_key!r} 不存在"
+        )
+
+    current_rules = crud.parse_rules(flag.rules_json)
+    current_variants = crud.parse_variants(flag.variants_json)
+    candidate_rules = [Rule(**r.model_dump()) for r in req.rules]
+    candidate_variants = [Variant(**v.model_dump()) for v in req.variants]
+
+    changes: list[PreviewChange] = []
+    migrations: dict[tuple[str, str], int] = {}
+    for user in req.users:
+        cur = decide(flag.flag_key, user.user_id, user.context, current_variants, current_rules)
+        cand = decide(
+            flag.flag_key, user.user_id, user.context, candidate_variants, candidate_rules
+        )
+        cur_result = (cur.variant_key, cur.decision_path, cur.matched_rule_index)
+        cand_result = (cand.variant_key, cand.decision_path, cand.matched_rule_index)
+        if cur_result == cand_result:
+            continue
+        changes.append(
+            PreviewChange(
+                user_id=user.user_id,
+                current=PreviewDecision(
+                    variant_key=cur.variant_key,
+                    decision_path=cur.decision_path,
+                    matched_rule_index=cur.matched_rule_index,
+                ),
+                candidate=PreviewDecision(
+                    variant_key=cand.variant_key,
+                    decision_path=cand.decision_path,
+                    matched_rule_index=cand.matched_rule_index,
+                ),
+            )
+        )
+        pair = (cur.variant_key, cand.variant_key)
+        migrations[pair] = migrations.get(pair, 0) + 1
+
+    return PreviewImpactResponse(
+        flag_key=flag.flag_key,
+        config_version=flag.version,
+        total_users=len(req.users),
+        changed_users=len(changes),
+        variant_migrations=[
+            VariantMigration(from_variant=src, to_variant=dst, count=count)
+            for (src, dst), count in sorted(migrations.items())
+        ],
+        changes=changes,
+    )
 
 
 @app.get("/api/v1/decisions/{request_id}")

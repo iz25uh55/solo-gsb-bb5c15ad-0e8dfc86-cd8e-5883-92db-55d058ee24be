@@ -32,9 +32,9 @@ class VariantIn(BaseModel):
     description: str = ""
 
 
-class FlagUpsertRequest(BaseModel):
-    flag_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
-    description: str = ""
+class VariantsRulesConfig(BaseModel):
+    """variants/rules 组合配置与一致性校验（创建接口与影响预览共用）。"""
+
     variants: list[VariantIn] = Field(min_length=2, description="至少配置两个加权变体")
     rules: list[RuleIn] = Field(default_factory=list)
 
@@ -50,7 +50,7 @@ class FlagUpsertRequest(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _rules_consistent(self) -> "FlagUpsertRequest":
+    def _rules_consistent(self) -> "VariantsRulesConfig":
         priorities = [r.priority for r in self.rules]
         if len(set(priorities)) != len(priorities):
             raise ValueError("规则 priority 不允许重复")
@@ -59,6 +59,11 @@ class FlagUpsertRequest(BaseModel):
             if r.variant_key not in variant_keys:
                 raise ValueError(f"规则(priority={r.priority})引用了不存在的变体 {r.variant_key!r}")
         return self
+
+
+class FlagUpsertRequest(VariantsRulesConfig):
+    flag_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    description: str = ""
 
 
 class FlagResponse(BaseModel):
@@ -124,3 +129,63 @@ class SnapshotResponse(BaseModel):
     variant_key: str
     explanation: list[ExplanationStep]
     decided_at: Any
+
+
+class PreviewUser(BaseModel):
+    """待评估用户：user_id + 规则匹配用的属性上下文。"""
+
+    user_id: str = Field(min_length=1, max_length=128)
+    context: dict[str, Any] = Field(
+        default_factory=dict, description="用户属性，规则按此匹配，如 {\"region\": \"cn\", \"age\": 20}"
+    )
+
+
+class PreviewImpactRequest(VariantsRulesConfig):
+    """发布前影响评估请求：候选 variants/rules（沿用创建接口校验）+ 互异用户列表。"""
+
+    users: list[PreviewUser] = Field(
+        min_length=1, max_length=500, description="1~500 个待评估用户，user_id 必须互异"
+    )
+
+    @field_validator("users")
+    @classmethod
+    def _user_ids_unique(cls, v: list[PreviewUser]) -> list[PreviewUser]:
+        ids = [u.user_id for u in v]
+        if len(set(ids)) != len(ids):
+            raise ValueError("users 中 user_id 不允许重复")
+        return v
+
+
+class PreviewDecision(BaseModel):
+    """单侧（当前配置 / 候选配置）的判定结果。"""
+
+    variant_key: str
+    decision_path: Literal["rule", "bucket"]
+    matched_rule_index: int | None = Field(
+        description="命中规则在按 priority 升序排序后的下标；无规则命中时为 null"
+    )
+
+
+class PreviewChange(BaseModel):
+    """判定结果发生变化的用户及其两侧结果。"""
+
+    user_id: str
+    current: PreviewDecision
+    candidate: PreviewDecision
+
+
+class VariantMigration(BaseModel):
+    """结果变化用户的变体迁移计数（from_variant -> to_variant）。"""
+
+    from_variant: str
+    to_variant: str
+    count: int
+
+
+class PreviewImpactResponse(BaseModel):
+    flag_key: str
+    config_version: int = Field(description="current 一侧判定使用的当前配置版本号")
+    total_users: int = Field(description="输入用户数")
+    changed_users: int = Field(description="判定结果发生变化的用户数")
+    variant_migrations: list[VariantMigration]
+    changes: list[PreviewChange] = Field(description="仅含结果变化的用户，按请求顺序返回")
