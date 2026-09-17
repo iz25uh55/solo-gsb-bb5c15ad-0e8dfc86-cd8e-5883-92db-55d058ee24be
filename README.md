@@ -63,6 +63,7 @@ curl -sS http://localhost:8000/api/v1/decisions/<request_id>
 | `GET` | `/api/v1/flags/{flag_key}/versions` | 列出全部配置版本（按版本号升序） |
 | `GET` | `/api/v1/flags/{flag_key}/versions/{version}` | 查看指定版本的完整配置 |
 | `POST` | `/api/v1/flags/{flag_key}/evaluate` | 判定（推荐，flag_key 在路径中，可指定 `config_version`） |
+| `POST` | `/api/v1/flags/{flag_key}/preview-impact` | 发布前候选配置影响预览（只读，不写版本 / 快照） |
 | `POST` | `/api/v1/evaluate` | 判定（flag_key 在请求体中） |
 | `GET` | `/api/v1/decisions/{request_id}` | 按 request_id 查询判定快照 |
 | `GET` | `/healthz` | 健康检查 |
@@ -170,6 +171,56 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/evaluate \
 
 判定请求可携带自定义 `request_id`。同一 `request_id` 的重复请求直接返回**首次判定快照**（即使第二次 context 或 `config_version` 不同），适合客户端超时重试。若同一 `request_id` 搭配了不同的 `flag_key/user_id`，返回 `409`。不携带时服务自动生成 UUID。
 
+### 发布前影响预览（只读）
+
+发布候选配置前，可用 `POST /api/v1/flags/{flag_key}/preview-impact` 评估影响：服务对请求中的每个用户分别用**当前线上版本**和**候选配置**做只读判定，仅返回结果发生变化的用户。
+
+- 请求体的 `variants` / `rules` 与[创建开关](#创建开关)**同结构、同校验**（权重和为 100、`priority` 唯一、规则引用的变体必须存在），不满足返回 `422`；
+- `users` 为 1～500 个评估对象，每个包含 `user_id` 与 `context`，`user_id` **不可重复**，为空、重复或超过 500 返回 `422`；
+- 开关不存在返回 `404`；
+- 预览**不会**创建配置版本、**不会**写入 `DecisionSnapshot`（可通过版本列表与 `/healthz` 的快照计数验证）；
+- 候选与当前判定复用同一套稳定哈希分桶与“首条命中规则”语义。
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/preview-impact \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "variants": [
+      {"key": "red",  "weight": 0},
+      {"key": "blue", "weight": 100}
+    ],
+    "rules": [
+      {"priority": 1, "attribute": "region", "operator": "eq", "values": ["cn"], "variant_key": "red"}
+    ],
+    "users": [
+      {"user_id": "user-1001", "context": {}},
+      {"user_id": "user-1002", "context": {"region": "cn"}}
+    ]
+  }'
+```
+
+响应（`changes` 按请求顺序排列，仅包含 `variant_key`、`decision_path`、`matched_rule_index` 任一发生变化的用户）：
+
+```json
+{
+  "flag_key": "btn_color",
+  "current_version": 1,
+  "total_users": 2,
+  "changed_users": 1,
+  "changes": [
+    {
+      "user_id": "user-1001",
+      "current":   {"variant_key": "red",  "decision_path": "bucket", "matched_rule_index": null},
+      "candidate": {"variant_key": "blue", "decision_path": "bucket", "matched_rule_index": null}
+    }
+  ],
+  "migration_counts": {"red": {"blue": 1}}
+}
+```
+
+- `current_version` 为当前线上版本，预览不会使版本号自增；
+- `migration_counts` 按“当前变体 → 候选变体”汇总迁移人数（仅统计变体发生变化的用户；变体不变、仅判定路径或命中规则变化的用户计入 `changed_users`，但不进入迁移计数）。
+
 ## 分桶算法
 
 ```
@@ -189,7 +240,7 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 │   ├── crud.py        # 配置、版本与快照持久化
 │   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / decision_snapshots）
 │   └── database.py    # 引擎与会话
-├── tests/             # pytest：引擎单测 + API 集成测试（35 项）
+├── tests/             # pytest：引擎单测 + API 集成测试（48 项）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

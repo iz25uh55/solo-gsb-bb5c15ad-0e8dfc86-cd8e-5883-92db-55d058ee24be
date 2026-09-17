@@ -8,6 +8,7 @@
 - GET  /api/v1/flags/{flag_key}/versions            列出版本历史
 - GET  /api/v1/flags/{flag_key}/versions/{version}  查看指定版本配置
 - POST /api/v1/flags/{flag_key}/evaluate  判定（按路径中的 flag_key，可指定 config_version）
+- POST /api/v1/flags/{flag_key}/preview-impact  发布前候选配置影响预览（只读，不落版本与快照）
 - POST /api/v1/evaluate           判定（flag_key 在请求体中）
 - GET  /api/v1/decisions/{request_id}     按 request_id 查询判定快照
 - GET  /healthz                   健康检查
@@ -23,6 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import crud
+from app import engine as eng
 from app.database import Base, engine, get_db
 from app.engine import RuleEvaluationError, decide
 from app.models import FlagConfig
@@ -32,6 +34,10 @@ from app.schemas import (
     FlagResponse,
     FlagUpsertRequest,
     FlagVersionResponse,
+    PreviewChange,
+    PreviewImpactRequest,
+    PreviewImpactResponse,
+    PreviewOutcome,
 )
 
 
@@ -299,6 +305,87 @@ def evaluate_by_path(flag_key: str, req: EvaluateRequest, db: Session = Depends(
             detail="路径 flag_key 与请求体 flag_key 不一致",
         )
     return _evaluate(req, db, flag_key)
+
+
+@app.post(
+    "/api/v1/flags/{flag_key}/preview-impact",
+    response_model=PreviewImpactResponse,
+)
+def preview_impact(
+    flag_key: str, req: PreviewImpactRequest, db: Session = Depends(get_db)
+) -> PreviewImpactResponse:
+    """发布前评估候选配置：当前版本与候选配置分别做只读判定并对比。
+
+    - 候选 variants/rules 沿用创建接口的全部校验（Pydantic 层返回 422）；
+    - 不写入配置版本，也不写入 DecisionSnapshot；
+    - 仅返回 variant_key / decision_path / matched_rule_index 任一发生变化的用户，
+      顺序与请求一致；汇总输入数、变化数及当前变体 -> 候选变体的迁移计数。
+    """
+    flag = crud.get_flag_or_none(db, flag_key)
+    if flag is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"开关 {flag_key!r} 不存在"
+        )
+
+    current_rules = crud.parse_rules(flag.rules_json)
+    current_variants = crud.parse_variants(flag.variants_json)
+
+    # 候选配置仅存在于请求内存中；RuleIn/VariantIn 与创建接口同结构、同校验
+    candidate_rules = [
+        eng.Rule(**r.model_dump())
+        for r in sorted(req.rules, key=lambda x: x.priority)
+    ]
+    candidate_variants = [eng.Variant(**v.model_dump()) for v in req.variants]
+
+    changes: list[PreviewChange] = []
+    migration: dict[str, dict[str, int]] = {}
+    for user in req.users:
+        current_decision = decide(
+            flag_key, user.user_id, user.context, current_variants, current_rules
+        )
+        candidate_decision = decide(
+            flag_key, user.user_id, user.context, candidate_variants, candidate_rules
+        )
+
+        current_outcome = PreviewOutcome(
+            variant_key=current_decision.variant_key,
+            decision_path=current_decision.decision_path,
+            matched_rule_index=current_decision.matched_rule_index,
+        )
+        candidate_outcome = PreviewOutcome(
+            variant_key=candidate_decision.variant_key,
+            decision_path=candidate_decision.decision_path,
+            matched_rule_index=candidate_decision.matched_rule_index,
+        )
+
+        if (
+            current_outcome.variant_key != candidate_outcome.variant_key
+            or current_outcome.decision_path != candidate_outcome.decision_path
+            or current_outcome.matched_rule_index != candidate_outcome.matched_rule_index
+        ):
+            changes.append(
+                PreviewChange(
+                    user_id=user.user_id,
+                    current=current_outcome,
+                    candidate=candidate_outcome,
+                )
+            )
+            # 仅变体迁移计入汇总；变体不变（仅判定路径 / 命中规则变化）不算迁移
+            if current_outcome.variant_key != candidate_outcome.variant_key:
+                migration.setdefault(current_outcome.variant_key, {})
+                bucket = migration[current_outcome.variant_key]
+                bucket[candidate_outcome.variant_key] = (
+                    bucket.get(candidate_outcome.variant_key, 0) + 1
+                )
+
+    return PreviewImpactResponse(
+        flag_key=flag_key,
+        current_version=flag.version,
+        total_users=len(req.users),
+        changed_users=len(changes),
+        changes=changes,
+        migration_counts=migration,
+    )
 
 
 @app.get("/api/v1/decisions/{request_id}")

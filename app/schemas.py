@@ -32,9 +32,12 @@ class VariantIn(BaseModel):
     description: str = ""
 
 
-class FlagUpsertRequest(BaseModel):
-    flag_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
-    description: str = ""
+class FlagConfigBody(BaseModel):
+    """开关配置体（variants + rules 及配套校验）。
+
+    创建 / 更新接口与发布前影响预览共用同一套候选配置校验。
+    """
+
     variants: list[VariantIn] = Field(min_length=2, description="至少配置两个加权变体")
     rules: list[RuleIn] = Field(default_factory=list)
 
@@ -50,7 +53,7 @@ class FlagUpsertRequest(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _rules_consistent(self) -> "FlagUpsertRequest":
+    def _rules_consistent(self) -> "FlagConfigBody":
         priorities = [r.priority for r in self.rules]
         if len(set(priorities)) != len(priorities):
             raise ValueError("规则 priority 不允许重复")
@@ -59,6 +62,11 @@ class FlagUpsertRequest(BaseModel):
             if r.variant_key not in variant_keys:
                 raise ValueError(f"规则(priority={r.priority})引用了不存在的变体 {r.variant_key!r}")
         return self
+
+
+class FlagUpsertRequest(FlagConfigBody):
+    flag_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    description: str = ""
 
 
 class FlagResponse(BaseModel):
@@ -124,3 +132,58 @@ class SnapshotResponse(BaseModel):
     variant_key: str
     explanation: list[ExplanationStep]
     decided_at: Any
+
+
+class PreviewUser(BaseModel):
+    """发布前影响预览的单个评估对象。"""
+
+    user_id: str = Field(min_length=1, max_length=128)
+    context: dict[str, Any] = Field(
+        default_factory=dict,
+        description="用户属性，规则按此匹配，如 {\"region\": \"cn\", \"age\": 20}",
+    )
+
+
+class PreviewImpactRequest(FlagConfigBody):
+    """发布前影响预览请求：候选配置与 1～500 个互异 user_id。
+
+    flag_key 取路径值，候选 variants/rules 的校验与创建接口完全一致。
+    """
+
+    users: list[PreviewUser] = Field(min_length=1, max_length=500)
+
+    @field_validator("users")
+    @classmethod
+    def _user_ids_unique(cls, v: list[PreviewUser]) -> list[PreviewUser]:
+        ids = [u.user_id for u in v]
+        if len(set(ids)) != len(ids):
+            raise ValueError("user_id 不允许重复")
+        return v
+
+
+class PreviewOutcome(BaseModel):
+    """单个配置下的判定结果（只读判定，无快照与解释链）。"""
+
+    variant_key: str
+    decision_path: Literal["rule", "bucket"]
+    matched_rule_index: int | None = Field(
+        description="排序后命中的规则下标（从 0 开始）；无规则命中时为 null"
+    )
+
+
+class PreviewChange(BaseModel):
+    """结果发生变化的单个用户（按请求顺序返回）。"""
+
+    user_id: str
+    current: PreviewOutcome
+    candidate: PreviewOutcome
+
+
+class PreviewImpactResponse(BaseModel):
+    flag_key: str
+    current_version: int = Field(description="当前线上配置版本；候选配置不会产生新版本")
+    total_users: int = Field(description="输入用户数")
+    changed_users: int = Field(description="结果发生变化的用户数")
+    changes: list[PreviewChange]
+    # {"<当前变体>": {"<候选变体>": 迁移人数, ...}, ...}，仅含非零计数
+    migration_counts: dict[str, dict[str, int]]
